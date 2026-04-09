@@ -1,14 +1,19 @@
 """
 Streamlit UI for replacement_llm.run_single_lookup.
 
+Each widget maps to the same arguments as ``replacement_llm.py`` CLI; values are passed
+directly to ``run_single_lookup()`` (no subprocess). Use the sidebar “Equivalent CLI”
+block to copy the matching command line.
+
 Local:  streamlit run app.py
-Cloud:  set main file to app.py; add secrets (ANTHROPIC_API_KEY, TAVILY_API_KEY) in Streamlit Cloud.
+Cloud:  Secrets — ANTHROPIC_API_KEY, TAVILY_API_KEY
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 from pathlib import Path
 
 import streamlit as st
@@ -50,7 +55,58 @@ st.set_page_config(
 )
 
 st.title("Product substitute lookup")
-st.caption("Tavily + Claude — default pipeline extracts source specs, then matches target-brand SKUs from web evidence.")
+st.caption(
+    "Form fields mirror `replacement_llm.py` flags. The app calls the same Python API "
+    "the CLI uses — see **Equivalent CLI** in the sidebar to copy a command line."
+)
+
+
+def build_equivalent_cli_command(
+    *,
+    source_brand: str,
+    product_code: str,
+    target_brand: str,
+    description: str,
+    legacy: bool,
+    tavily_depth: str | None,
+    top_search_results: int,
+    max_substitutes: int,
+    max_target_queries: int,
+    llm_expand: bool,
+    max_llm_search_queries: int,
+) -> str:
+    """Single line for display (POSIX-style quoting; fine for Git Bash / WSL / docs)."""
+    parts = [
+        "python",
+        "replacement_llm.py",
+        "--no-prompt",
+        "--source-brand",
+        shlex.quote(source_brand.strip()),
+        "-c",
+        shlex.quote(product_code.strip()),
+        "--target-brand",
+        shlex.quote(target_brand.strip()),
+    ]
+    if (description or "").strip():
+        parts += ["-d", shlex.quote(description.strip())]
+    if tavily_depth:
+        parts += ["--tavily-depth", shlex.quote(tavily_depth)]
+    parts += [
+        "--top-search-results",
+        str(int(top_search_results)),
+        "--max-substitutes",
+        str(int(max_substitutes)),
+        "--max-target-queries",
+        str(int(max_target_queries)),
+    ]
+    if llm_expand:
+        parts.append("--llm-expand-search")
+        parts += ["--max-llm-search-queries", str(int(max_llm_search_queries))]
+    if legacy:
+        parts.append("--legacy-single-pass")
+    parts.append("-q")
+    return " ".join(parts)
+
 
 anthropic_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
 tavily_ok = bool(os.environ.get("TAVILY_API_KEY"))
@@ -62,37 +118,112 @@ if not anthropic_ok or not tavily_ok:
     st.stop()
 
 with st.sidebar:
-    st.header("Options")
-    legacy = st.checkbox("Legacy single-pass search", value=False, help="Skip spec extraction; one merged Tavily pass.")
-    tavily_depth = st.selectbox(
-        "Tavily depth",
+    st.header("CLI-linked options")
+    legacy = st.checkbox(
+        "`--legacy-single-pass`",
+        value=False,
+        help="Legacy: one merged Tavily pass + single match (no attribute pipeline).",
+    )
+    tavily_depth_sel = st.selectbox(
+        "`--tavily-depth`",
         options=["(env default)", "basic", "fast", "ultra-fast", "advanced"],
         index=0,
+        help="Tavily search_depth; advanced uses 2 API credits per search.",
     )
-    depth_val = None if tavily_depth == "(env default)" else tavily_depth
-    top_results = st.slider("Results per Tavily query", 3, 15, 8)
-    max_subs = st.slider("Max substitutes", 1, 10, 5)
-    max_target_q = st.slider("Max target queries (attribute pipeline)", 3, 12, 8)
+    depth_val = None if tavily_depth_sel == "(env default)" else tavily_depth_sel
+    top_results = st.slider(
+        "`--top-search-results`",
+        min_value=3,
+        max_value=15,
+        value=8,
+        help="Max results returned per Tavily query.",
+    )
+    max_subs = st.slider(
+        "`--max-substitutes`",
+        min_value=1,
+        max_value=10,
+        value=5,
+        help="Max substitute rows from Claude.",
+    )
+    max_target_q = st.slider(
+        "`--max-target-queries`",
+        min_value=3,
+        max_value=12,
+        value=8,
+        help="Attribute pipeline: cap on target-brand Tavily queries.",
+    )
     llm_expand = st.checkbox(
-        "LLM expand (legacy only)",
+        "`--llm-expand-search`",
         value=False,
-        help="Extra search queries from Claude; only applies in legacy mode.",
+        help="Legacy only: Claude proposes extra search queries.",
+    )
+    max_llm_q = st.slider(
+        "`--max-llm-search-queries`",
+        min_value=1,
+        max_value=8,
+        value=3,
+        help="Used only when --llm-expand-search is on.",
+        disabled=not llm_expand,
     )
 
-st.subheader("Product")
+    st.divider()
+    st.markdown("**Widget → flag** (main form)")
+    st.markdown(
+        "| Widget | CLI |\n|--------|-----|\n"
+        "| Source brand | `--source-brand` |\n"
+        "| Product code | `-c` / `--product-code` |\n"
+        "| Target brand | `--target-brand` |\n"
+        "| Description | `-d` / `--description` |\n"
+        "| (Streamlit always supplies values) | `--no-prompt` |\n"
+        "| (no stderr spam) | `-q` / `--quiet` |\n"
+    )
+
+st.subheader("Inputs (same as CLI)")
 c1, c2, c3 = st.columns(3)
 with c1:
-    source_brand = st.text_input("Source brand", value="SAL", placeholder="e.g. SAL")
+    source_brand = st.text_input(
+        "Source brand",
+        value="SAL",
+        placeholder="e.g. SAL",
+        help="CLI: `--source-brand`",
+    )
 with c2:
-    product_code = st.text_input("Product code", placeholder="e.g. S9065TCWH")
+    product_code = st.text_input(
+        "Product code",
+        placeholder="e.g. S9065TCWH",
+        help="CLI: `-c` / `--product-code`",
+    )
 with c3:
-    target_brand = st.text_input("Target brand", value="Haneco", placeholder="e.g. Haneco")
+    target_brand = st.text_input(
+        "Target brand",
+        value="Haneco",
+        placeholder="e.g. Haneco",
+        help="CLI: `--target-brand`",
+    )
 
 description = st.text_area(
-    "Description (optional, recommended)",
+    "Description (optional)",
     placeholder="e.g. 9W tri-colour dimmable downlight 92mm cutout IP44",
     height=80,
+    help="CLI: `-d` / `--description`",
 )
+
+cli_preview = build_equivalent_cli_command(
+    source_brand=source_brand or "",
+    product_code=product_code or "",
+    target_brand=target_brand or "",
+    description=description or "",
+    legacy=legacy,
+    tavily_depth=depth_val,
+    top_search_results=top_results,
+    max_substitutes=max_subs,
+    max_target_queries=max_target_q,
+    llm_expand=llm_expand,
+    max_llm_search_queries=max_llm_q,
+)
+with st.sidebar:
+    with st.expander("Equivalent CLI (copy)", expanded=False):
+        st.code(cli_preview, language="bash")
 
 run = st.button("Run lookup", type="primary", use_container_width=True)
 
@@ -101,7 +232,7 @@ if run:
         st.warning("Fill in source brand, product code, and target brand.")
     else:
         with st.status("Running Tavily + Claude (may take 30–90 seconds)…", expanded=True) as status:
-            status.write("Searching and matching…")
+            status.write("Calling `run_single_lookup()` with the same arguments as the CLI above…")
             try:
                 payload = m.run_single_lookup(
                     source_brand=source_brand.strip(),
@@ -113,6 +244,7 @@ if run:
                     top_search_results=int(top_results),
                     max_substitutes=int(max_subs),
                     llm_expand_search=llm_expand,
+                    max_llm_search_queries=int(max_llm_q),
                     tavily_search_depth=depth_val,
                     legacy_single_pass=legacy,
                     max_target_queries=int(max_target_q),
@@ -125,6 +257,8 @@ if run:
                 st.stop()
 
         st.success(f"Pipeline: **{payload.get('pipeline', '')}**")
+        st.caption("Equivalent command used for the same logic:")
+        st.code(cli_preview, language="bash")
 
         prof = payload.get("source_profile")
         if isinstance(prof, dict) and prof.get("summary"):
