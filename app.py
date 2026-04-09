@@ -44,15 +44,16 @@ def _apply_streamlit_secrets() -> None:
         pass
 
 
-_apply_streamlit_secrets()
-
-import replacement_llm as m
-
+# Must be the first Streamlit command — accessing st.secrets before this causes a blank/black UI.
 st.set_page_config(
     page_title="Product substitute lookup",
     page_icon="🔍",
     layout="wide",
 )
+
+_apply_streamlit_secrets()
+
+import replacement_llm as m
 
 st.title("Product substitute lookup")
 st.caption(
