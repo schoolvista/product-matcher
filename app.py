@@ -53,8 +53,8 @@ st.set_page_config(
 
 _apply_streamlit_secrets()
 
-import replacement_llm as m
-
+# Defer importing replacement_llm (pandas, etc.) until Run — on Streamlit Cloud a heavy
+# top-level import can delay or fail the first run and leave a black screen with no widgets.
 st.title("Product substitute lookup")
 st.caption(
     "Form fields mirror `replacement_llm.py` flags. The app calls the same Python API "
@@ -235,6 +235,8 @@ if run:
         with st.status("Running Tavily + Claude (may take 30–90 seconds)…", expanded=True) as status:
             status.write("Calling `run_single_lookup()` with the same arguments as the CLI above…")
             try:
+                import replacement_llm as m
+
                 payload = m.run_single_lookup(
                     source_brand=source_brand.strip(),
                     product_code=product_code.strip(),
