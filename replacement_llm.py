@@ -1,5 +1,5 @@
 """
-Find a target-brand match for a source product using Tavily Search + Anthropic Claude.
+Find substitute matches for a source product using Tavily Search + Anthropic Claude.
 
 API keys (any one of):
   - A ``.env`` file next to this script or in the current working directory
@@ -7,21 +7,22 @@ API keys (any one of):
   - ``--env-file PATH`` to load a specific .env
 
 Variables: ANTHROPIC_API_KEY, TAVILY_API_KEY
-Optional: ANTHROPIC_MODEL, TAVILY_SEARCH_DEPTH, TAVILY_TARGET_DOMAINS (comma-separated domains
-for target-brand searches only)
+Optional: ANTHROPIC_MODEL, TAVILY_SEARCH_DEPTH, TAVILY_TARGET_DOMAINS (comma-separated domains;
+only applied when a **target brand** is set)
 
-Single-product mode (default): prompts or flags for source brand, product code, target brand.
+Single-product mode (default): prompts or flags for source brand, product code, and optional
+target brand (omit target brand for open-web / cross-brand search).
 Batch mode: pass --input path to Excel/CSV (see module docstring for columns).
 
 Default flow (attribute pipeline):
   1) Search for the **source** product and have the LLM extract specs (wattage, cutout, IP,
      colour temp, dimmable, product type, etc.).
-  2) Run **target-brand** searches built from those specs (not the source SKU on target sites).
-  3) Match **target product codes** (e.g. Haneco VIVA110) that appear in evidence to the
-     extracted profile. SKUs must still appear in snippets — the model does not invent them.
+  2) Run **target-brand** searches from those specs, or **open-web** queries if no target brand.
+  3) Match product codes that appear in evidence to the extracted profile. SKUs must still
+     appear in snippets — the model does not invent them. Each substitute includes ``matched_brand``.
 
-Optional: ``--legacy-single-pass`` uses the older one-shot search + match. Optional env
-``TAVILY_TARGET_DOMAINS`` (comma-separated, e.g. ``haneco.com.au``) limits target-phase searches.
+Optional env ``TAVILY_TARGET_DOMAINS`` (comma-separated, e.g. ``haneco.com.au``) limits
+target-phase searches when a target brand is specified.
 """
 
 from __future__ import annotations
@@ -32,8 +33,10 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import requests
@@ -238,60 +241,25 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     return json.loads(text)
 
 
-def claude_suggest_substitutes(
-    client: Anthropic,
-    model: str,
-    source_brand: str,
-    target_brand: str,
-    product_code: str,
-    description: str,
-    search_context: str,
-    max_substitutes: int,
-) -> dict[str, Any]:
-    system = (
-        "You are a careful lighting and electrical procurement assistant. "
-        "You only use the web search snippets provided; do not invent specific "
-        "product codes or URLs that do not appear in the evidence. "
-        "If evidence is weak, say so and lower confidence. "
-        "Respond with a single JSON object only (no markdown outside JSON)."
-    )
-    user = f"""Source brand / manufacturer (existing product): {source_brand}
-Manufacturer product code: {product_code}
-Product description (optional): {description or "(none provided)"}
-
-Target brand to find a matching product from: {target_brand}
-
-Web search results (snippets only; may be incomplete or wrong):
-{search_context}
-
-Return JSON with this exact shape:
-{{
-  "substitutes": [
-    {{
-      "suggested_identifier": "string — model/SKU or product name as shown in evidence",
-      "confidence": "low|medium|high",
-      "reasoning": "short explanation tied to snippets",
-      "cited_urls": ["urls from the search results that support this suggestion"]
-    }}
-  ],
-  "overall_notes": "string — limitations, missing data, or if no good match found"
-}}
-
-Rules:
-- At most {max_substitutes} items in substitutes; fewer is fine if evidence is weak.
-- Every cited_urls entry must be copied exactly from the URLs shown in the search results above.
-- If nothing relevant to {target_brand} appears in the snippets, substitutes may be empty."""
-
-    msg = client.messages.create(
-        model=model,
-        max_tokens=2048,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    block = msg.content[0]
-    if block.type != "text":
-        raise RuntimeError(f"Unexpected response block type: {block.type}")
-    return _extract_json_object(block.text)
+def _finalize_matched_brands(llm: dict[str, Any], *, default_brand: str) -> None:
+    """Normalise manufacturer label on each substitute; use default_brand when target was fixed."""
+    db = (default_brand or "").strip()
+    for s in llm.get("substitutes") or []:
+        if not isinstance(s, dict):
+            continue
+        raw = (
+            s.get("matched_brand")
+            or s.get("manufacturer_brand")
+            or s.get("brand")
+            or ""
+        )
+        raw = str(raw).strip()
+        if raw:
+            s["matched_brand"] = raw
+        elif db:
+            s["matched_brand"] = db
+        else:
+            s["matched_brand"] = ""
 
 
 def claude_extract_source_product_profile(
@@ -301,6 +269,7 @@ def claude_extract_source_product_profile(
     product_code: str,
     user_description: str,
     source_search_context: str,
+    cross_brand: bool = False,
 ) -> dict[str, Any]:
     """Parse source-product evidence into structured specs for cross-brand matching."""
     system = (
@@ -308,15 +277,7 @@ def claude_extract_source_product_profile(
         "Use ONLY the search evidence and the user description; use null if unknown. "
         "Respond with a single JSON object only (no markdown)."
     )
-    user = f"""Source brand: {source_brand}
-Source manufacturer code: {product_code}
-User-provided description (may be empty): {user_description or "(none)"}
-
-Search evidence (retailer pages, datasheets, etc.):
-{source_search_context}
-
-Return JSON with this exact shape:
-{{
+    common_fields = """{{
   "summary": "one concise line describing the fitting",
   "product_type": "e.g. recessed LED downlight, batten, floodlight",
   "wattage_w": null or number,
@@ -328,7 +289,33 @@ Return JSON with this exact shape:
   "body_finish": null or string e.g. white,
   "ic_or_insulation_rating_note": null or string,
   "voltage_v": null or number,
-  "series_or_family": null or string,
+  "series_or_family": null or string,"""
+
+    if cross_brand:
+        tail = """
+  "cross_brand_search_queries": [
+    "up to 6 short web search queries to find equivalent products from any manufacturer — combine specs above with terms like equivalent, substitute, alternative, datasheet, cross reference"
+  ]
+}}
+
+Rules for cross_brand_search_queries:
+- Each string must be a complete web search query (no placeholders).
+- Use wattage, cutout, IP, CCT, dimmable, product type from above — avoid queries that are ONLY the source SKU with no product context.
+- Each query under 100 characters if possible."""
+        user = f"""Source brand: {source_brand}
+Source manufacturer code: {product_code}
+User-provided description (may be empty): {user_description or "(none)"}
+
+The user did **not** specify a single target supplier. Later we will search the open web for substitutes from **any** brands.
+
+Search evidence (retailer pages, datasheets, etc.):
+{source_search_context}
+
+Return JSON with this exact shape:
+{common_fields}
+{tail}"""
+    else:
+        tail = """
   "tavily_queries_for_target_brand": [
     "up to 5 short web search queries that INCLUDE the target brand name once we search for substitutes — you do NOT know the target brand here, so use the literal placeholder TARGET_BRAND in each query string"
   ]
@@ -338,6 +325,16 @@ Rules for tavily_queries_for_target_brand:
 - Exactly use the substring TARGET_BRAND in each query (we will replace it with the real brand).
 - Focus on specs above (wattage, cutout, IP, CCT, dimmable, product type) — NOT the competitor SKU.
 - Each query under 100 characters if possible."""
+        user = f"""Source brand: {source_brand}
+Source manufacturer code: {product_code}
+User-provided description (may be empty): {user_description or "(none)"}
+
+Search evidence (retailer pages, datasheets, etc.):
+{source_search_context}
+
+Return JSON with this exact shape:
+{common_fields}
+{tail}"""
 
     msg = client.messages.create(
         model=model,
@@ -416,6 +413,59 @@ def build_target_queries_from_profile(
     return _dedupe_queries(out)[:max(1, max_queries)]
 
 
+def build_cross_brand_queries_from_profile(
+    profile: dict[str, Any],
+    source_brand: str,
+    product_code: str,
+    user_description: str,
+    max_queries: int,
+) -> list[str]:
+    """Tavily queries to find substitutes from any manufacturer (no fixed target brand)."""
+    sb = source_brand.strip()
+    code = product_code.strip()
+    out: list[str] = []
+
+    raw_llm = profile.get("cross_brand_search_queries") or profile.get(
+        "cross_brand_equivalent_queries"
+    )
+    if isinstance(raw_llm, list):
+        for q in raw_llm:
+            if isinstance(q, str) and q.strip():
+                out.append(q.strip())
+
+    watt = profile.get("wattage_w")
+    cut = profile.get("cutout_or_hole_mm")
+    ip = profile.get("ip_rating")
+    pt = (profile.get("product_type") or "").strip()
+    cct = (profile.get("colour_temperature") or "").strip()
+    dim = profile.get("dimmable")
+
+    spec_parts: list[str] = []
+    if isinstance(watt, (int, float)):
+        spec_parts.append(f"{int(watt)}W")
+    if isinstance(cut, (int, float)):
+        spec_parts.append(f"{int(cut)}mm cutout")
+    if ip:
+        spec_parts.append(str(ip))
+    if cct and len(cct) < 80:
+        spec_parts.append(cct)
+    if dim is True:
+        spec_parts.append("dimmable")
+    if pt:
+        spec_parts.append(pt)
+    core = " ".join(spec_parts).strip()
+    if core:
+        out.append(f"{core} LED downlight product code datasheet")
+    out.append(f"(equivalent OR substitute OR cross reference) {sb} {code}")
+    out.append(f"{sb} {code} alternative manufacturer LED")
+    if user_description.strip():
+        short = _short_desc_for_query(user_description, 100)
+        if short:
+            out.append(f"{short} LED product model")
+
+    return _dedupe_queries(out)[:max(1, max_queries)]
+
+
 def claude_match_target_by_profile(
     client: Anthropic,
     model: str,
@@ -425,18 +475,58 @@ def claude_match_target_by_profile(
     profile: dict[str, Any],
     target_search_context: str,
     max_substitutes: int,
+    cross_brand: bool = False,
 ) -> dict[str, Any]:
-    """Pick target-brand SKU(s) from evidence that align with the extracted source profile."""
+    """Pick SKU(s) from evidence: one target brand, or any brand when cross_brand."""
     profile_json = json.dumps(profile, ensure_ascii=False, indent=2)
-    system = (
-        "You match a target supplier's product codes to a source product's technical profile. "
-        "You may ONLY name target product codes/SKUs that literally appear in the target-brand "
-        "search evidence (titles, snippets, URLs). Do not invent Haneco/SAL codes. "
-        "If no target SKU in evidence fits reasonably, return an empty candidates list. "
-        "Respond with a single JSON object only (no markdown)."
-    )
-    user = f"""Source: {source_brand} / code {source_product_code}
-Target brand to buy from: {target_brand}
+    tb = (target_brand or "").strip()
+
+    if cross_brand:
+        system = (
+            "You match equivalent lighting/electrical products from web search evidence. "
+            "You may ONLY name product codes/SKUs that literally appear in the evidence "
+            "(titles, snippets, URLs). Do not invent model codes. "
+            "For each substitute, name the manufacturer/brand as shown in the evidence. "
+            "Respond with a single JSON object only (no markdown)."
+        )
+        user = f"""Source: {source_brand} / code {source_product_code}
+No single target brand was specified — consider products from **any** brands in the evidence.
+
+Extracted source product profile (from web evidence):
+{profile_json}
+
+Web search results (may include multiple manufacturers):
+{target_search_context}
+
+Return JSON:
+{{
+  "substitutes": [
+    {{
+      "suggested_identifier": "exact product code or model as it appears in evidence",
+      "matched_brand": "manufacturer or brand name for that product as shown in evidence (required)",
+      "confidence": "low|medium|high",
+      "attribute_match": "which profile fields align or differ vs this SKU in evidence",
+      "reasoning": "brief",
+      "cited_urls": ["urls from the search results that mention this SKU"]
+    }}
+  ],
+  "overall_notes": "string"
+}}
+
+Rules:
+- At most {max_substitutes} substitutes; fewer is OK.
+- suggested_identifier must be copied from text in the evidence, not guessed.
+- cited_urls must be copied exactly from the search results above."""
+    else:
+        system = (
+            "You match a target supplier's product codes to a source product's technical profile. "
+            "You may ONLY name target product codes/SKUs that literally appear in the target-brand "
+            "search evidence (titles, snippets, URLs). Do not invent Haneco/SAL codes. "
+            "If no target SKU in evidence fits reasonably, return an empty candidates list. "
+            "Respond with a single JSON object only (no markdown)."
+        )
+        user = f"""Source: {source_brand} / code {source_product_code}
+Target brand to buy from: {tb}
 
 Extracted source product profile (from web evidence):
 {profile_json}
@@ -449,6 +539,7 @@ Return JSON:
   "substitutes": [
     {{
       "suggested_identifier": "exact target product code or model as it appears in evidence e.g. VIVA110-MULTI",
+      "matched_brand": "manufacturer for that line item (usually {tb}) as shown in evidence",
       "confidence": "low|medium|high",
       "attribute_match": "which profile fields align or differ vs this SKU's description in evidence",
       "reasoning": "brief",
@@ -484,6 +575,12 @@ Rules:
                     "suggested_identifier": c.get("target_product_code")
                     or c.get("suggested_identifier")
                     or "",
+                    "matched_brand": (
+                        c.get("matched_brand")
+                        or c.get("manufacturer_brand")
+                        or c.get("brand")
+                        or ""
+                    ),
                     "confidence": c.get("confidence", ""),
                     "reasoning": (c.get("attribute_match") or "")
                     + " "
@@ -503,108 +600,46 @@ Rules:
     return data
 
 
-def claude_propose_target_brand_queries(
-    client: Anthropic,
-    model: str,
-    source_brand: str,
-    target_brand: str,
-    product_code: str,
-    description: str,
-    source_product_snippets: str,
-    max_queries: int,
-) -> list[str]:
-    """Use LLM to suggest search queries that surface *target* brand hits using specs, not only competitor SKU."""
-    system = (
-        "You help procurement researchers write short web search queries. "
-        "Respond with a single JSON object only (no markdown)."
-    )
-    user = f"""We need to find **{target_brand}** products that could replace this source item:
-- Source brand: {source_brand}
-- Product code: {product_code}
-- Description: {description or "(none)"}
-
-The snippets below are from a search for the source product. Other brands rarely use
-{source_brand}'s product code on their own pages, so we need new queries that will surface
-**{target_brand}** catalogues, datasheets, or shops using **product type and specs**
-(wattage, cut-out, IP, CCT, beam angle, dimming, shape, series names) visible in the text.
-
-Snippets:
-{source_product_snippets}
-
-Return JSON exactly:
-{{"follow_up_search_queries": ["query1", "query2", ...]}}
-
-Rules:
-- At most {max_queries} queries.
-- Every query MUST include the word **{target_brand}** (or obvious spelling) so results skew to that brand.
-- Prefer concrete attributes from the snippets/description over repeating only "{product_code}".
-- Each query under 120 characters."""
-
-    msg = client.messages.create(
-        model=model,
-        max_tokens=512,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    block = msg.content[0]
-    if block.type != "text":
-        return []
+def _tavily_one_query(
+    index: int,
+    query: str,
+    *,
+    tavily_api_key: str,
+    top_search_results: int,
+    search_depth: str | None,
+    include_domains: list[str] | None,
+) -> tuple[int, list[dict[str, str]], str | None, float, str, str]:
+    """Run one Tavily search; return (index, hits, error_or_none, duration_s, start_iso, end_iso)."""
+    t_start = datetime.now().astimezone()
+    start_iso = t_start.isoformat(timespec="seconds")
+    t0 = time.perf_counter()
     try:
-        data = _extract_json_object(block.text)
-    except (json.JSONDecodeError, ValueError):
-        return []
-    raw = (
-        data.get("follow_up_search_queries")
-        or data.get("follow_up_google_queries")
-        or data.get("queries")
-        or []
-    )
-    if not isinstance(raw, list):
-        return []
-    out = []
-    for item in raw[:max_queries]:
-        if isinstance(item, str) and item.strip():
-            out.append(item.strip())
-    return out
-
-
-def default_search_queries(
-    source_brand: str,
-    target_brand: str,
-    product_code: str,
-    description: str,
-) -> list[str]:
-    """Mix source identification, cross-reference style, and target-brand + attribute queries."""
-    sb = source_brand.strip()
-    tb = target_brand.strip()
-    code = product_code.strip()
-    desc = (description or "").strip()
-
-    queries: list[str] = []
-
-    # 1) Source product (specs, distributors — good context, rarely lists other brands' SKUs)
-    src_q = f'"{sb}" {code}'
-    if desc:
-        src_q += f" {desc}"
-    queries.append(src_q)
-
-    # 2) Cross-reference / equivalent (sometimes wholesalers publish matrices)
-    queries.append(
-        f"{tb} (equivalent OR substitute OR cross reference OR comparable OR compatible) "
-        f"{sb} {code}"
-    )
-
-    # 3) Target brand + generic product terms (competitor code often absent on target sites)
-    short = _short_desc_for_query(desc, 110)
-    if short:
-        queries.append(f"{tb} {short}")
-    else:
-        queries.append(f"{tb} LED lighting fitting {code}")
-
-    # 4) Target brand catalogue / product discovery
-    queries.append(f"{tb} (catalogue OR catalog OR products OR range OR series) LED")
-
-    return _dedupe_queries(queries)
+        rows = tavily_search(
+            query,
+            tavily_api_key,
+            num_results=top_search_results,
+            search_depth=search_depth,
+            include_domains=include_domains,
+        )
+        t_end = datetime.now().astimezone()
+        return (
+            index,
+            rows,
+            None,
+            time.perf_counter() - t0,
+            start_iso,
+            t_end.isoformat(timespec="seconds"),
+        )
+    except Exception as e:
+        t_end = datetime.now().astimezone()
+        return (
+            index,
+            [],
+            f"{query!r}: {e}",
+            time.perf_counter() - t0,
+            start_iso,
+            t_end.isoformat(timespec="seconds"),
+        )
 
 
 def run_tavily_query_list(
@@ -615,36 +650,103 @@ def run_tavily_query_list(
     include_domains: list[str] | None = None,
     verbose: bool = False,
     progress_prefix: str = "",
+    *,
+    parallel: bool = True,
+    max_workers: int | None = None,
+    step_callback: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, str]], list[str], list[str]]:
-    """Returns (merged_results, errors_per_query, queries_executed_in_order)."""
-    all_groups: list[list[dict[str, str]]] = []
-    errors: list[str] = []
+    """Returns (merged_results, errors_per_query, queries_executed_in_order).
+
+    When ``parallel`` is True and there is more than one query, Tavily requests run
+    concurrently (merge order matches ``queries`` order).
+    """
+    if not queries:
+        return [], [], []
+
     n = len(queries)
-    for i, q in enumerate(queries, 1):
+    all_groups: list[list[dict[str, str]]]
+    errors: list[str] = []
+
+    use_parallel = parallel and n > 1
+    if use_parallel:
+        workers = max(1, min(max_workers or 8, n))
         if verbose:
-            qshort = (q[:72] + "…") if len(q) > 72 else q
-            _progress(f"  Tavily {i}/{n}: {qshort}", prefix=progress_prefix)
-        try:
-            all_groups.append(
-                tavily_search(
+            _progress(
+                f"  Tavily parallel {n} query/queries ({workers} workers)…",
+                prefix=progress_prefix,
+            )
+        results: list[
+            tuple[int, list[dict[str, str]], str | None, float, str, str]
+        ] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            future_map = {
+                ex.submit(
+                    _tavily_one_query,
+                    i,
                     q,
-                    tavily_api_key,
-                    num_results=top_search_results,
+                    tavily_api_key=tavily_api_key,
+                    top_search_results=top_search_results,
                     search_depth=search_depth,
                     include_domains=include_domains,
-                )
+                ): i
+                for i, q in enumerate(queries)
+            }
+            for fut in as_completed(future_map):
+                idx, rows, err, dur, s_iso, e_iso = fut.result()
+                results.append((idx, rows, err, dur, s_iso, e_iso))
+                q = queries[idx]
+                qshort = (q[:56] + "…") if len(q) > 56 else q
+                if step_callback:
+                    hits_n = len(rows)
+                    err_note = f" — error: `{err}`" if err else f" — {hits_n} hit(s)"
+                    step_callback(
+                        f"Tavily query **{idx + 1}/{n}** `{qshort}` — "
+                        f"start `{s_iso}` → end `{e_iso}` — **{dur:.2f}s**{err_note}"
+                    )
+                if verbose:
+                    _progress(
+                        f"  Tavily {idx + 1}/{n} done ({dur:.1f}s): "
+                        f"{(q[:72] + '…') if len(q) > 72 else q}",
+                        prefix=progress_prefix,
+                    )
+        results.sort(key=lambda r: r[0])
+        all_groups = []
+        for idx, rows, err, _dur, _s, _e in results:
+            all_groups.append(rows)
+            if err:
+                errors.append(err)
+    else:
+        all_groups = []
+        for i, q in enumerate(queries, 1):
+            if verbose:
+                qshort = (q[:72] + "…") if len(q) > 72 else q
+                _progress(f"  Tavily {i}/{n}: {qshort}", prefix=progress_prefix)
+            idx, rows, err, dur, s_iso, e_iso = _tavily_one_query(
+                i - 1,
+                q,
+                tavily_api_key=tavily_api_key,
+                top_search_results=top_search_results,
+                search_depth=search_depth,
+                include_domains=include_domains,
             )
-        except Exception as e:
-            all_groups.append([])
-            errors.append(f"{q!r}: {e}")
-            if verbose:
-                _progress(f"  ! error: {e}", prefix=progress_prefix)
-        else:
-            if verbose:
-                nh = len(all_groups[-1])
-                _progress(f"  ← {nh} hit(s)", prefix=progress_prefix)
+            all_groups.append(rows)
+            if err:
+                errors.append(err)
+                if verbose:
+                    _progress(f"  ! error: {err}", prefix=progress_prefix)
+            else:
+                if verbose:
+                    _progress(f"  ← {len(rows)} hit(s)", prefix=progress_prefix)
+            if step_callback:
+                qshort = (q[:56] + "…") if len(q) > 56 else q
+                err_note = f" — error: `{err}`" if err else f" — {len(rows)} hit(s)"
+                step_callback(
+                    f"Tavily query **{i}/{n}** `{qshort}` — "
+                    f"start `{s_iso}` → end `{e_iso}` — **{dur:.2f}s**{err_note}"
+                )
+
     merged = merge_search_results(*all_groups)
-    return merged, errors, queries
+    return merged, errors, list(queries)
 
 
 def run_single_lookup(
@@ -656,117 +758,41 @@ def run_single_lookup(
     anthropic_key: str,
     top_search_results: int,
     max_substitutes: int,
-    queries: list[str] | None = None,
-    llm_expand_search: bool = False,
-    max_llm_search_queries: int = 3,
     tavily_search_depth: str | None = None,
-    legacy_single_pass: bool = False,
     max_target_queries: int = 8,
     anthropic_client: Anthropic | None = None,
     verbose: bool = True,
     progress_prefix: str = "",
+    step_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if Anthropic is None:
         raise RuntimeError("Install anthropic: pip install anthropic")
 
     client = anthropic_client or Anthropic(api_key=anthropic_key)
     pf = progress_prefix
+    tb = (target_brand or "").strip()
 
-    if legacy_single_pass or queries is not None:
-        base_queries = (
-            queries
-            if queries is not None
-            else default_search_queries(source_brand, target_brand, product_code, description)
+    def _emit(msg: str) -> None:
+        if step_callback:
+            step_callback(msg)
+
+    def _phase_start(label: str) -> tuple[float, str]:
+        s_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+        _emit(f"▶ **{label}** — started `{s_iso}`")
+        return time.perf_counter(), s_iso
+
+    def _phase_end(label: str, t0: float, s_iso: str) -> None:
+        e_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+        dur = time.perf_counter() - t0
+        _emit(
+            f"✓ **{label}** — ended `{e_iso}` · **{dur:.2f}s** (started `{s_iso}`)"
         )
 
-        llm_proposed: list[str] = []
-        if llm_expand_search and queries is None and base_queries:
-            if verbose:
-                _progress("Legacy: extra Tavily + LLM for follow-up queries…", prefix=pf)
-            early_hits, _, _ = run_tavily_query_list(
-                [base_queries[0]],
-                tavily_api_key,
-                top_search_results,
-                search_depth=tavily_search_depth,
-                verbose=verbose,
-                progress_prefix=pf,
-            )
-            snippet_text = _format_search_context(early_hits)
-            try:
-                llm_proposed = claude_propose_target_brand_queries(
-                    client=client,
-                    model=_anthropic_model(),
-                    source_brand=source_brand,
-                    target_brand=target_brand,
-                    product_code=product_code,
-                    description=description,
-                    source_product_snippets=snippet_text,
-                    max_queries=max_llm_search_queries,
-                )
-            except Exception:
-                llm_proposed = []
-
-        qlist = _dedupe_queries(list(base_queries) + llm_proposed)
-        if verbose:
-            _progress(
-                f"Legacy: running {len(qlist)} Tavily search(es), then Claude match…",
-                prefix=pf,
-            )
-        merged, errors, executed = run_tavily_query_list(
-            qlist,
-            tavily_api_key,
-            top_search_results,
-            search_depth=tavily_search_depth,
-            verbose=verbose,
-            progress_prefix=pf,
-        )
-        if verbose:
-            _progress(
-                f"  Merged {len(merged)} unique page(s). Calling Claude…",
-                prefix=pf,
-            )
-        ctx = _format_search_context(merged)
-
-        try:
-            parsed = claude_suggest_substitutes(
-                client=client,
-                model=_anthropic_model(),
-                source_brand=source_brand,
-                target_brand=target_brand,
-                product_code=product_code,
-                description=description,
-                search_context=ctx,
-                max_substitutes=max_substitutes,
-            )
-        except Exception as e:
-            parsed = {"substitutes": [], "overall_notes": f"LLM error: {e}"}
-
-        if verbose:
-            ns = len(parsed.get("substitutes") or [])
-            _progress(f"Done (legacy). {ns} substitute(s) suggested.", prefix=pf)
-
-        return {
-            "source_brand": source_brand,
-            "product_code": product_code,
-            "target_brand": target_brand,
-            "description": description,
-            "source_profile": None,
-            "source_search_queries": [],
-            "target_search_queries": [],
-            "search_queries": executed,
-            "llm_proposed_queries": llm_proposed,
-            "search_errors": errors,
-            "source_result_count": 0,
-            "target_result_count": len(merged),
-            "result_count": len(merged),
-            "llm": parsed,
-            "pipeline": "legacy",
-        }
-
-    # --- Spec extraction + target-brand search + attribute match (default) ---
+    # --- Spec extraction + target-brand or open-web search + attribute match ---
     if verbose:
+        dest = tb if tb else "(any brand)"
         _progress(
-            f"Attribute pipeline: {source_brand} {product_code} → {target_brand}",
+            f"Attribute pipeline: {source_brand} {product_code} → {dest}",
             prefix=pf,
         )
         _progress("Step 1/4: Tavily — source product…", prefix=pf)
@@ -775,6 +801,7 @@ def run_single_lookup(
     if description.strip():
         src_q += f" {description.strip()}"
 
+    t_s1, iso_s1 = _phase_start("Step 1/4 — Tavily (source product)")
     src_hits, src_err, src_exec = run_tavily_query_list(
         [src_q],
         tavily_api_key,
@@ -783,7 +810,9 @@ def run_single_lookup(
         include_domains=None,
         verbose=verbose,
         progress_prefix=pf,
+        step_callback=None,
     )
+    _phase_end("Step 1/4 — Tavily (source product)", t_s1, iso_s1)
     src_ctx = _format_search_context(src_hits)
 
     if verbose:
@@ -792,6 +821,7 @@ def run_single_lookup(
             prefix=pf,
         )
 
+    t_s2, iso_s2 = _phase_start("Step 2/4 — Claude (extract source profile)")
     try:
         profile = claude_extract_source_product_profile(
             client=client,
@@ -800,31 +830,57 @@ def run_single_lookup(
             product_code=product_code,
             user_description=description,
             source_search_context=src_ctx,
+            cross_brand=not tb,
         )
     except Exception:
         profile = {}
     if not isinstance(profile, dict):
         profile = {}
+    _phase_end("Step 2/4 — Claude (extract source profile)", t_s2, iso_s2)
 
-    doms = _tavily_include_domains()
-    tqueries = build_target_queries_from_profile(
-        target_brand,
-        profile,
-        product_code,
-        description,
-        max_target_queries,
-    )
+    doms = None if not tb else _tavily_include_domains()
+    if tb:
+        tqueries = build_target_queries_from_profile(
+            tb,
+            profile,
+            product_code,
+            description,
+            max_target_queries,
+        )
+    else:
+        tqueries = build_cross_brand_queries_from_profile(
+            profile,
+            source_brand,
+            product_code,
+            description,
+            max_target_queries,
+        )
     if not tqueries:
-        tb = target_brand.strip()
-        tqueries = [f"{tb} LED downlight", f"{tb} products downlight"]
+        if tb:
+            tqueries = [f"{tb} LED downlight", f"{tb} products downlight"]
+        else:
+            tqueries = build_cross_brand_queries_from_profile(
+                profile,
+                source_brand,
+                product_code,
+                description,
+                max_target_queries,
+            )
 
     if verbose:
         dom_note = f" [domains: {', '.join(doms)}]" if doms else ""
+        qkind = "open-web / cross-brand" if not tb else "target-brand"
         _progress(
-            f"Step 3/4: Tavily — {len(tqueries)} target-brand search(es){dom_note}…",
+            f"Step 3/4: Tavily — {len(tqueries)} {qkind} search(es){dom_note}…",
             prefix=pf,
         )
 
+    nq = len(tqueries)
+    if nq > 1:
+        step3_label = f"Step 3/4 — Tavily ({nq} queries, parallel)"
+    else:
+        step3_label = f"Step 3/4 — Tavily ({nq} query)"
+    t_s3, iso_s3 = _phase_start(step3_label)
     tgt_hits, tgt_err, tgt_exec = run_tavily_query_list(
         tqueries,
         tavily_api_key,
@@ -833,28 +889,35 @@ def run_single_lookup(
         include_domains=doms,
         verbose=verbose,
         progress_prefix=pf,
+        parallel=True,
+        step_callback=step_callback,
     )
+    _phase_end(step3_label, t_s3, iso_s3)
     tgt_ctx = _format_search_context(tgt_hits)
 
     if verbose:
         _progress(
-            f"Step 4/4: Claude — match target SKU(s); {len(tgt_hits)} target page(s)…",
+            f"Step 4/4: Claude — match SKU(s); {len(tgt_hits)} evidence page(s)…",
             prefix=pf,
         )
 
+    t_s4, iso_s4 = _phase_start("Step 4/4 — Claude (match substitutes)")
     try:
         parsed = claude_match_target_by_profile(
             client=client,
             model=_anthropic_model(),
             source_brand=source_brand,
             source_product_code=product_code,
-            target_brand=target_brand,
+            target_brand=target_brand or "",
             profile=profile,
             target_search_context=tgt_ctx,
             max_substitutes=max_substitutes,
+            cross_brand=not tb,
         )
     except Exception as e:
         parsed = {"substitutes": [], "overall_notes": f"LLM error: {e}"}
+    _finalize_matched_brands(parsed, default_brand=tb)
+    _phase_end("Step 4/4 — Claude (match substitutes)", t_s4, iso_s4)
 
     if verbose:
         ns = len(parsed.get("substitutes") or [])
@@ -863,7 +926,7 @@ def run_single_lookup(
     return {
         "source_brand": source_brand,
         "product_code": product_code,
-        "target_brand": target_brand,
+        "target_brand": target_brand or "",
         "description": description,
         "source_profile": profile,
         "source_search_queries": src_exec,
@@ -880,7 +943,7 @@ def run_single_lookup(
 
 
 def print_single_report(payload: dict[str, Any]) -> None:
-    pipe = payload.get("pipeline", "legacy")
+    pipe = payload.get("pipeline", "attribute")
     print(f"\n--- Pipeline: {pipe} ---")
     prof = payload.get("source_profile")
     if prof and isinstance(prof, dict) and prof.get("summary"):
@@ -901,7 +964,12 @@ def print_single_report(payload: dict[str, Any]) -> None:
         for q in ssq:
             print(f"    {q}")
     if tsq:
-        print("  Target-brand queries:")
+        tlabel = (
+            "Target-brand queries:"
+            if (payload.get("target_brand") or "").strip()
+            else "Open-web / cross-brand queries:"
+        )
+        print(f"  {tlabel}")
         for q in tsq:
             print(f"    {q}")
     if not ssq and not tsq:
@@ -924,13 +992,17 @@ def print_single_report(payload: dict[str, Any]) -> None:
     else:
         print(f"  Unique result pages merged: {payload['result_count']}")
 
-    print("\n--- Suggested matches ({}) ---".format(payload["target_brand"]))
+    tb_disp = (payload.get("target_brand") or "").strip() or "any brand"
+    print(f"\n--- Suggested matches ({tb_disp}) ---")
     llm = payload["llm"]
     subs = llm.get("substitutes") or []
     if not subs:
         print("  (none)")
     for i, s in enumerate(subs, 1):
+        mb = (s.get("matched_brand") or "").strip()
         print(f"\n  [{i}] {s.get('suggested_identifier', '')}")
+        if mb:
+            print(f"      Brand: {mb}")
         print(f"      Confidence: {s.get('confidence', '')}")
         print(f"      Reasoning: {s.get('reasoning', '')}")
         urls = s.get("cited_urls") or []
@@ -962,21 +1034,27 @@ def resolve_single_args(
             for n, v in [
                 ("--source-brand", source_brand),
                 ("--product-code", product_code),
-                ("--target-brand", target_brand),
             ]
             if not (v or "").strip()
         ]
         if missing:
             raise SystemExit(
                 "Missing required arguments (use --no-prompt with all of): "
-                "--source-brand, --product-code, --target-brand"
+                "--source-brand, --product-code"
             )
-        return source_brand.strip(), product_code.strip(), target_brand.strip(), description.strip()
+        return (
+            source_brand.strip(),
+            product_code.strip(),
+            (target_brand or "").strip(),
+            description.strip(),
+        )
 
     print("Product match lookup (Tavily + Claude). Leave blank to type.\n")
     sb = (source_brand or "").strip() or prompt_line("Source brand / manufacturer")
     pc = (product_code or "").strip() or prompt_line("Manufacturer product code")
-    tb = (target_brand or "").strip() or prompt_line("Target brand (match to find)")
+    tb = (target_brand or "").strip() or prompt_line(
+        "Target brand (optional — Enter for any / cross-brand)", ""
+    )
     desc = (description or "").strip()
     if not desc:
         desc = prompt_line("Product description (optional)", "")
@@ -995,10 +1073,7 @@ def run_batch(
     limit_rows: int | None,
     tavily_api_key: str,
     api_key: str,
-    llm_expand_search: bool = False,
-    max_llm_search_queries: int = 3,
     tavily_search_depth: str | None = None,
-    legacy_single_pass: bool = False,
     max_target_queries: int = 8,
     verbose: bool = True,
 ) -> None:
@@ -1016,8 +1091,7 @@ def run_batch(
 
     nrows = len(df)
     if verbose:
-        pipe = "legacy single-pass" if legacy_single_pass else "attribute"
-        _progress(f"Batch: {nrows} row(s), {pipe} pipeline → {output_path.name}")
+        _progress(f"Batch: {nrows} row(s), attribute pipeline → {output_path.name}")
 
     client = Anthropic(api_key=api_key)
     rows_out: list[dict[str, Any]] = []
@@ -1035,16 +1109,6 @@ def run_batch(
             supplier=sup,
         )
 
-        if legacy_single_pass:
-            legacy_queries = _dedupe_queries(
-                [seed]
-                + default_search_queries(
-                    source_supplier, target_supplier, str(code), str(desc)
-                )
-            )
-        else:
-            legacy_queries = None
-
         if verbose:
             _progress(f"━━ Row {num}/{nrows}: {code} ━━")
 
@@ -1057,11 +1121,7 @@ def run_batch(
             anthropic_key=api_key,
             top_search_results=top_search_results,
             max_substitutes=max_substitutes,
-            queries=legacy_queries,
-            llm_expand_search=llm_expand_search,
-            max_llm_search_queries=max_llm_search_queries,
             tavily_search_depth=tavily_search_depth,
-            legacy_single_pass=legacy_single_pass,
             max_target_queries=max_target_queries,
             anthropic_client=client,
             verbose=verbose,
@@ -1097,6 +1157,7 @@ def run_batch(
                     **base,
                     "substitute_rank": j + 1,
                     "suggested_identifier": sub.get("suggested_identifier", ""),
+                    "matched_brand": (sub.get("matched_brand") or "").strip(),
                     "confidence": sub.get("confidence", ""),
                     "reasoning": sub.get("reasoning", ""),
                     "cited_urls": "; ".join(sub.get("cited_urls") or []),
@@ -1109,6 +1170,7 @@ def run_batch(
                     **base,
                     "substitute_rank": "",
                     "suggested_identifier": "",
+                    "matched_brand": "",
                     "confidence": "",
                     "reasoning": "",
                     "cited_urls": "",
@@ -1130,10 +1192,9 @@ def run_batch(
 def main() -> None:
     p = argparse.ArgumentParser(
         description=(
-            "Find target-brand product matches using Tavily + Anthropic. "
-            "Default: extract specs from source product web results, search the target brand "
-            "by attributes, then match a target SKU from evidence. "
-            "Use --legacy-single-pass for the older single merged search."
+            "Find substitute product matches using Tavily + Anthropic. "
+            "Extract specs from source product web results, search the target brand "
+            "by attributes (or the open web if --target-brand is omitted), then match SKUs from evidence."
         )
     )
     p.add_argument(
@@ -1154,7 +1215,10 @@ def main() -> None:
         "--target-supplier",
         dest="target_brand",
         default="",
-        help="Brand to find a matching product from",
+        help=(
+            "Brand to find a matching product from (optional). "
+            "If omitted, search across manufacturers on the open web."
+        ),
     )
     p.add_argument(
         "--description",
@@ -1217,20 +1281,6 @@ def main() -> None:
         help="Load API keys from this .env file (overrides .env next to script / in CWD)",
     )
     p.add_argument(
-        "--llm-expand-search",
-        action="store_true",
-        help=(
-            "Legacy mode only: extra search queries from LLM after source snippets "
-            "(uses more API calls). Ignored for the default attribute pipeline."
-        ),
-    )
-    p.add_argument(
-        "--max-llm-search-queries",
-        type=int,
-        default=3,
-        help="Max extra search queries proposed by the LLM when --llm-expand-search is set",
-    )
-    p.add_argument(
         "--tavily-depth",
         default=None,
         choices=["basic", "fast", "ultra-fast", "advanced"],
@@ -1238,15 +1288,13 @@ def main() -> None:
         "advanced uses 2 API credits per search.",
     )
     p.add_argument(
-        "--legacy-single-pass",
-        action="store_true",
-        help="Old behaviour: one merged Tavily pass + single match (no spec extraction step).",
-    )
-    p.add_argument(
         "--max-target-queries",
         type=int,
         default=8,
-        help="Attribute pipeline: max Tavily queries for the target brand (default 8).",
+        help=(
+            "Attribute pipeline: max Tavily queries for the target brand or open-web search "
+            "(default 8)."
+        ),
     )
     p.add_argument(
         "--quiet",
@@ -1286,7 +1334,7 @@ def main() -> None:
             input_path=args.input,
             output_path=args.output,
             source_supplier=args.source_brand or "SAL",
-            target_supplier=args.target_brand or "Haneco",
+            target_supplier=(args.target_brand or "").strip() or "Haneco",
             search_query_template=args.query_template,
             top_search_results=args.top_search_results,
             max_substitutes=args.max_substitutes,
@@ -1294,10 +1342,7 @@ def main() -> None:
             limit_rows=args.limit,
             tavily_api_key=tavily_key,
             api_key=api_key,
-            llm_expand_search=args.llm_expand_search,
-            max_llm_search_queries=args.max_llm_search_queries,
             tavily_search_depth=tavily_depth,
-            legacy_single_pass=args.legacy_single_pass,
             max_target_queries=args.max_target_queries,
             verbose=show_progress,
         )
@@ -1320,10 +1365,7 @@ def main() -> None:
         anthropic_key=api_key,
         top_search_results=args.top_search_results,
         max_substitutes=args.max_substitutes,
-        llm_expand_search=args.llm_expand_search,
-        max_llm_search_queries=args.max_llm_search_queries,
         tavily_search_depth=tavily_depth,
-        legacy_single_pass=args.legacy_single_pass,
         max_target_queries=args.max_target_queries,
         verbose=show_progress,
     )

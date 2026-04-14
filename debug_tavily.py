@@ -48,9 +48,17 @@ def main() -> None:
         print("Set TAVILY_API_KEY or add it to .env", file=sys.stderr)
         sys.exit(1)
 
-    queries = m.default_search_queries(
-        args.source_brand, args.target_brand, args.code, args.description
-    )
+    sb = args.source_brand.strip()
+    tb = (args.target_brand or "").strip()
+    code = args.code.strip()
+    desc = (args.description or "").strip()
+    queries = [f'"{sb}" {code}' + (f" {desc}" if desc else "")]
+    if tb:
+        queries.append(
+            f"{tb} (equivalent OR substitute OR cross reference) {sb} {code}"
+        )
+    else:
+        queries.append(f"(equivalent OR substitute) {sb} {code} LED")
     needle = (args.needle or "").lower()
 
     # UTF-8 on Windows consoles
